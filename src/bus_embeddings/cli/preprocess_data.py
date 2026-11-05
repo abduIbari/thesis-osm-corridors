@@ -3,15 +3,76 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from bus_embeddings.logging import get_logger, setup_logging
-from bus_embeddings.data.loaders import load_travel_times, load_dwell_times
+from bus_embeddings.data.loaders import iter_travel_times, iter_dwell_times
 from bus_embeddings.data.thresholds import (
     filter_travel_time_freeflow_ratio,
     filter_dwell_times,
 )
 
 logger = get_logger(__name__)
+
+# Column types of the output files (same as the former single df.to_parquet)
+TRAVEL_SCHEMA = pa.schema([
+    ("from_stop", pa.string()),
+    ("to_stop", pa.string()),
+    ("from_time", pa.timestamp("ns", tz="UTC")),
+    ("to_time", pa.timestamp("ns", tz="UTC")),
+    ("travel_time", pa.float64()),
+    ("link", pa.string()),
+    ("municipality", pa.string()),
+])
+DWELL_SCHEMA = pa.schema([
+    ("stop", pa.string()),
+    ("from_time", pa.timestamp("ns", tz="UTC")),
+    ("to_time", pa.timestamp("ns", tz="UTC")),
+    ("travel_time", pa.float64()),
+    ("municipality", pa.string()),
+])
+
+
+class _ParquetAppender:
+    """Append DataFrame pieces to one parquet file with a fixed schema.
+
+    Writes to ``<name>.tmp`` and renames it to the final name only when the
+    block exits without error, so an aborted run leaves no complete-looking file.
+    """
+
+    def __init__(self, path: Path, schema: pa.Schema) -> None:
+        self.path = path
+        self.tmp_path = path.with_name(path.name + ".tmp")
+        self.schema = schema
+        self.rows = 0
+        self._writer: pq.ParquetWriter | None = None
+
+    def write(self, df: pd.DataFrame) -> None:
+        # Cast to the fixed schema, so empty pieces can't change column types
+        table = pa.Table.from_pandas(df, schema=self.schema, preserve_index=False)
+        if self._writer is None:
+            # The first piece's schema also carries the pandas dtype metadata
+            self._writer = pq.ParquetWriter(self.tmp_path, table.schema)
+        if table.num_rows > 0:
+            self._writer.write_table(table)
+            self.rows += table.num_rows
+
+    def __enter__(self) -> "_ParquetAppender":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            try:
+                if self._writer is not None:
+                    self._writer.close()
+            finally:
+                self.tmp_path.unlink(missing_ok=True)
+            return
+        if self._writer is None:  # no pieces at all: still write an empty file
+            self._writer = pq.ParquetWriter(self.tmp_path, self.schema)
+        self._writer.close()
+        self.tmp_path.replace(self.path)
 
 
 def _discover_csv_regions(
@@ -83,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for parquet files.",
     )
     parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=2_000_000,
+        help="Rows read from a CSV per piece (bounds peak memory).",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -109,56 +176,53 @@ def main() -> None:
     #     bounds; rows without a link node (e.g. self-loops) are dropped too
     #   - Dwell:  drop terminus stops and dwells above DWELL_TIME_CAP
     # ------------------------------------------------------------------
-    travel_dfs: list[pd.DataFrame] = []
-    dwell_dfs: list[pd.DataFrame] = []
-
-    for region in regions:
-        tt_path = str(Path(args.travel_times_dir) / f"{region}.csv")
-        dw_path = str(Path(args.dwell_times_dir) / f"{region}.csv")
-
-        df_tt = load_travel_times(tt_path)
-        df_dw = load_dwell_times(dw_path)
-
-        n_tt_before = len(df_tt)
-        n_dw_before = len(df_dw)
-
-        link_nodes = _load_link_nodes(artifacts_dir, region)
-        stop_nodes = _load_stop_nodes(artifacts_dir, region)
-
-        df_tt = filter_travel_time_freeflow_ratio(df_tt, link_nodes)
-        df_dw = filter_dwell_times(df_dw, stop_nodes)
-
-        logger.info(
-            "Region %s: travel %d → %d (−%.1f%%), dwell %d → %d (−%.1f%%)",
-            region,
-            n_tt_before, len(df_tt),
-            100.0 * (n_tt_before - len(df_tt)) / max(n_tt_before, 1),
-            n_dw_before, len(df_dw),
-            100.0 * (n_dw_before - len(df_dw)) / max(n_dw_before, 1),
-        )
-
-        df_tt["municipality"] = region
-        df_dw["municipality"] = region
-
-        travel_dfs.append(df_tt)
-        dwell_dfs.append(df_dw)
-
-    df_travel_all = pd.concat(travel_dfs, ignore_index=True)
-    df_dwell_all = pd.concat(dwell_dfs, ignore_index=True)
-
-    logger.info(
-        "Combined: %d travel time records, %d dwell time records",
-        len(df_travel_all), len(df_dwell_all),
-    )
-
+    # Each CSV is read in pieces, and each cleaned piece is appended to the
+    # output at once, so memory holds one piece at a time.
     travel_out = output_dir / "travel_times.parquet"
     dwell_out = output_dir / "dwell_times.parquet"
 
-    df_travel_all.to_parquet(travel_out, engine="pyarrow", index=False)
-    df_dwell_all.to_parquet(dwell_out, engine="pyarrow", index=False)
+    with (
+        _ParquetAppender(travel_out, TRAVEL_SCHEMA) as travel_writer,
+        _ParquetAppender(dwell_out, DWELL_SCHEMA) as dwell_writer,
+    ):
+        for region in regions:
+            tt_path = str(Path(args.travel_times_dir) / f"{region}.csv")
+            dw_path = str(Path(args.dwell_times_dir) / f"{region}.csv")
 
-    logger.info("Saved travel times → %s (%d rows)", travel_out, len(df_travel_all))
-    logger.info("Saved dwell times  → %s (%d rows)", dwell_out, len(df_dwell_all))
+            link_nodes = _load_link_nodes(artifacts_dir, region)
+            stop_nodes = _load_stop_nodes(artifacts_dir, region)
+
+            n_tt_before = n_tt_after = 0
+            for df_tt in iter_travel_times(tt_path, chunk_rows=args.chunk_rows):
+                n_tt_before += len(df_tt)
+                df_tt = filter_travel_time_freeflow_ratio(df_tt, link_nodes)
+                df_tt["municipality"] = region
+                travel_writer.write(df_tt)
+                n_tt_after += len(df_tt)
+
+            n_dw_before = n_dw_after = 0
+            for df_dw in iter_dwell_times(dw_path, chunk_rows=args.chunk_rows):
+                n_dw_before += len(df_dw)
+                df_dw = filter_dwell_times(df_dw, stop_nodes)
+                df_dw["municipality"] = region
+                dwell_writer.write(df_dw)
+                n_dw_after += len(df_dw)
+
+            logger.info(
+                "Region %s: travel %d → %d (−%.1f%%), dwell %d → %d (−%.1f%%)",
+                region,
+                n_tt_before, n_tt_after,
+                100.0 * (n_tt_before - n_tt_after) / max(n_tt_before, 1),
+                n_dw_before, n_dw_after,
+                100.0 * (n_dw_before - n_dw_after) / max(n_dw_before, 1),
+            )
+
+    logger.info(
+        "Combined: %d travel time records, %d dwell time records",
+        travel_writer.rows, dwell_writer.rows,
+    )
+    logger.info("Saved travel times → %s (%d rows)", travel_out, travel_writer.rows)
+    logger.info("Saved dwell times  → %s (%d rows)", dwell_out, dwell_writer.rows)
     logger.info("Preprocessing complete.")
 
 
