@@ -2,7 +2,7 @@
 
 Run from ~/thesis after corridors.py build:
 
-    bus-embeddings/thesis/.venv/bin/python -I bus-embeddings/thesis/pages/corridor_map.py GM0503 delft
+    bus-embeddings-corridor/thesis/.venv/bin/python -I bus-embeddings-corridor/thesis/pages/corridor_map.py GM0503 delft
 """
 
 import csv

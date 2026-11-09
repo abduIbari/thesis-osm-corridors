@@ -2,9 +2,9 @@
 
 Run from ~/thesis with -I, because the inputs are downloaded data:
 
-    PY=bus-embeddings/thesis/.venv/bin/python
-    $PY -I bus-embeddings/thesis/corridors.py cut GM0503
-    $PY -I bus-embeddings/thesis/corridors.py build GM0503
+    PY=bus-embeddings-corridor/thesis/.venv/bin/python
+    $PY -I bus-embeddings-corridor/thesis/corridors.py cut GM0503
+    $PY -I bus-embeddings-corridor/thesis/corridors.py build GM0503
 
 Output of `build` in data/corridor/geometry/<GM>/, coordinates in EPSG:28992:
     links.csv          id, lengths, detour ratio, odd-route flag, corridor area
