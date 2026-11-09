@@ -45,7 +45,8 @@ from bus_embeddings.data.proxy_task_dataset import (
     GlobalScaler,
     ProxyTaskBatchIterator,
     RawObservationProxyDataset,
-    load_observations,
+    load_observation_groups,
+    observation_municipalities,
 )
 from bus_embeddings.logging import get_logger, setup_logging
 from bus_embeddings.models.embedding_gnn import BaseEmbeddingGNN, build_model
@@ -574,6 +575,7 @@ class FoldData:
             log_transform=self.log_transform,
             link_scaler=fitted.link_scaler if fitted is not None else None,
             stop_scaler=fitted.stop_scaler if fitted is not None else None,
+            release_inputs=True,
         )
 
 
@@ -621,19 +623,35 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Data and graphs
     # ------------------------------------------------------------------
-    df_travel_all, df_dwell_all = load_observations(
-        args.travel_times_parquet, args.dwell_times_parquet,
-    )
-    municipalities = set(df_travel_all["municipality"].unique()) & set(df_dwell_all["municipality"].unique())
+    municipalities = observation_municipalities(args.travel_times_parquet, args.dwell_times_parquet)
     train_regions, val_regions, test_regions = assign_regions_to_splits(
         discover_regions(args.artifacts_dir, municipalities)
     )
     regions = {"train": train_regions, "val": val_regions, "test": test_regions}
 
-    # Observations per region group
-    travel = {g: df_travel_all[df_travel_all["municipality"].isin(r)] for g, r in regions.items()}
-    dwell = {g: df_dwell_all[df_dwell_all["municipality"].isin(r)] for g, r in regions.items()}
-    del df_travel_all, df_dwell_all
+    # The test group is only needed for the test_spatial subset of each fold.
+    # Until then only its time range is kept, for the fold boundaries.
+    test_group = {"test": regions["test"]}
+    test_travel, test_dwell = load_observation_groups(
+        args.travel_times_parquet, args.dwell_times_parquet, test_group,
+    )
+    test_time_extremes = [
+        extreme
+        for df in (test_travel["test"], test_dwell["test"])
+        for extreme in (df["from_time"].min(), df["from_time"].max())
+    ]
+    del test_travel, test_dwell
+
+    # Observations per region group, read directly from disk so the full
+    # tables are never in memory.
+    travel, dwell = load_observation_groups(
+        args.travel_times_parquet, args.dwell_times_parquet,
+        {"train": regions["train"], "val": regions["val"]},
+    )
+    logger.info(
+        "Loaded %d travel time and %d dwell time observations",
+        sum(len(df) for df in travel.values()), sum(len(df) for df in dwell.values()),
+    )
 
     # Validation and test graphs are normalized with the training statistics
     graphs: Dict[str, HeteroData] = {}
@@ -653,10 +671,16 @@ def main() -> None:
         for group, nodes in link_nodes.items()
     }
 
-    boundaries = fold_boundaries(
-        pd.concat([travel["train"], travel["val"], travel["test"]]),
-        pd.concat([dwell["train"], dwell["val"], dwell["test"]]),
-    )
+    # fold_boundaries only uses the min and max of from_time; pass those of
+    # every group instead of concatenating all observations (empty groups
+    # give NaT, which min() and max() skip like on the concatenated frame).
+    time_range = pd.DataFrame({"from_time": pd.Series([
+        extreme
+        for frames in (travel, dwell)
+        for df in frames.values()
+        for extreme in (df["from_time"].min(), df["from_time"].max())
+    ] + test_time_extremes, dtype=travel["train"]["from_time"].dtype)})
+    boundaries = fold_boundaries(time_range, time_range)
 
     group_name = f"{args.model}_{datetime.now().strftime('%y-%m-%d_%H:%M:%S')}"
     fold_metrics: List[Dict[str, float]] = []
@@ -711,6 +735,14 @@ def main() -> None:
         # Evaluate the selected model on all subsets
         results = {"val_spatial": val_result}
         for subset in ("train", "val_temporal", "test_temporal", "test_spatial"):
+            if subset == "test_spatial":
+                # FoldData reads the same dicts, so it sees the test group
+                test_travel, test_dwell = load_observation_groups(
+                    args.travel_times_parquet, args.dwell_times_parquet, test_group,
+                )
+                travel.update(test_travel)
+                dwell.update(test_dwell)
+                del test_travel, test_dwell
             dataset = train_dataset if subset == "train" else data.dataset(subset, fitted=train_dataset)
             result = evaluate(
                 model, graphs[SUBSETS[subset][0]], dataset, device, hyperparams,
@@ -721,6 +753,8 @@ def main() -> None:
             add_scaled_errors(result, dataset, data.observations(subset), per_region=subset != "train")
             results[subset] = result
             del dataset
+            if subset == "test_spatial":
+                del travel["test"], dwell["test"]
 
         metrics = {
             f"{subset}/{key}": value
