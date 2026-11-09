@@ -6,11 +6,13 @@ label (dwell time > 0) and, if the bus stopped, a dwell time target. Targets
 are z-scored with scalers fitted on the training data.
 """
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import holidays
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 
 from bus_embeddings.logging import get_logger
@@ -23,6 +25,9 @@ _NL_HOLIDAYS = holidays.Netherlands(years=range(2015, 2030))  # type: ignore[att
 # of year, public holiday flag.
 TIME_CONTEXT_DIM = 12
 
+# Rows handled at once by compute_time_context; only affects peak memory.
+TIME_CONTEXT_CHUNK_ROWS = 200_000
+
 # One batch: (link_indices, link_ctx, link_targets,
 #             stop_indices, stop_ctx, stop_targets, stop_labels)
 Batch = Tuple[
@@ -32,23 +37,97 @@ Batch = Tuple[
 ]
 
 
+# Observation columns used after preprocessing (to_time, from_stop and
+# to_stop are not needed for training or scoring)
+TRAVEL_COLUMNS = ["from_time", "travel_time", "link", "municipality"]
+DWELL_COLUMNS = ["stop", "from_time", "travel_time", "municipality"]
+
+
 def load_observations(
     travel_times_parquet: str | Path,
     dwell_times_parquet: str | Path,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the preprocessed travel and dwell time observations (UTC timestamps)."""
-    df_travel = pd.read_parquet(travel_times_parquet, engine="pyarrow")
-    df_dwell = pd.read_parquet(dwell_times_parquet, engine="pyarrow")
-    for col in ["from_time", "to_time"]:
-        if df_travel[col].dt.tz is None:
-            df_travel[col] = df_travel[col].dt.tz_localize("UTC")
-        if df_dwell[col].dt.tz is None:
-            df_dwell[col] = df_dwell[col].dt.tz_localize("UTC")
+    """Load the preprocessed travel and dwell time observations (UTC timestamps).
+
+    Reads only the columns that training and scoring use (see
+    ``TRAVEL_COLUMNS`` and ``DWELL_COLUMNS``) to keep memory use down.
+    """
+    df_travel = pd.read_parquet(travel_times_parquet, engine="pyarrow", columns=TRAVEL_COLUMNS)
+    df_dwell = pd.read_parquet(dwell_times_parquet, engine="pyarrow", columns=DWELL_COLUMNS)
+    for df in (df_travel, df_dwell):
+        if df["from_time"].dt.tz is None:
+            df["from_time"] = df["from_time"].dt.tz_localize("UTC")
     logger.info(
         "Loaded %d travel time and %d dwell time observations",
         len(df_travel), len(df_dwell),
     )
     return df_travel, df_dwell
+
+
+def _file_municipalities(parquet_path: str | Path) -> set[str]:
+    """Municipalities in one observation file, reading only that column."""
+    table = pq.read_table(parquet_path, columns=["municipality"], read_dictionary=["municipality"])
+    municipalities = set(table["municipality"].unique().to_pylist())
+    del table
+    pa.default_memory_pool().release_unused()
+    return municipalities
+
+
+def observation_municipalities(
+    travel_times_parquet: str | Path,
+    dwell_times_parquet: str | Path,
+) -> set[str]:
+    """Municipalities present in both files, without loading the observations."""
+    return _file_municipalities(travel_times_parquet) & _file_municipalities(dwell_times_parquet)
+
+
+def _read_municipalities(
+    parquet_path: str | Path,
+    columns: List[str],
+    municipalities: List[str],
+) -> pd.DataFrame:
+    """Read the rows of some municipalities from disk, in file order (UTC timestamps).
+
+    Matches ``df[df["municipality"].isin(municipalities)]`` on the full table.
+    Rows come back in file order (checked against row-group reads on the full data).
+    """
+    if municipalities:
+        df = pd.read_parquet(
+            parquet_path,
+            engine="pyarrow",
+            columns=columns,
+            filters=[("municipality", "in", municipalities)],
+            use_threads=False,
+        )
+    else:
+        # pyarrow rejects an empty "in" filter
+        df = pq.read_schema(parquet_path).empty_table().select(columns).to_pandas()
+    pa.default_memory_pool().release_unused()
+    if df["from_time"].dt.tz is None:
+        df["from_time"] = df["from_time"].dt.tz_localize("UTC")
+    return df
+
+
+def load_observation_groups(
+    travel_times_parquet: str | Path,
+    dwell_times_parquet: str | Path,
+    regions: Dict[str, List[str]],
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    """Travel and dwell observations per region group, read directly from disk.
+
+    Each group holds the same rows in the same order as filtering the output
+    of ``load_observations`` with ``isin``, but the full tables are never in
+    memory. Index labels may differ.
+    """
+    travel = {
+        name: _read_municipalities(travel_times_parquet, TRAVEL_COLUMNS, municipalities)
+        for name, municipalities in regions.items()
+    }
+    dwell = {
+        name: _read_municipalities(dwell_times_parquet, DWELL_COLUMNS, municipalities)
+        for name, municipalities in regions.items()
+    }
+    return travel, dwell
 
 
 class GlobalScaler:
@@ -92,7 +171,20 @@ class GlobalScaler:
 
 
 def compute_time_context(timestamps: pd.DatetimeIndex) -> np.ndarray:
-    """Time context of each timestamp, ``[n, TIME_CONTEXT_DIM]``."""
+    """Time context of each timestamp, ``[n, TIME_CONTEXT_DIM]``.
+
+    Filled in chunks, so the temporary arrays stay small.
+    """
+    n = len(timestamps)
+    time_context = np.empty((n, TIME_CONTEXT_DIM), dtype=np.float32)
+    for start in range(0, n, TIME_CONTEXT_CHUNK_ROWS):
+        stop = start + TIME_CONTEXT_CHUNK_ROWS
+        time_context[start:stop] = _time_context_chunk(timestamps[start:stop])
+    return time_context
+
+
+def _time_context_chunk(timestamps: pd.DatetimeIndex) -> np.ndarray:
+    """Time context of one chunk of timestamps."""
     minutes = timestamps.hour * 60 + timestamps.minute
     tod_fraction = minutes / 1440.0
     sin_tod = np.sin(2 * np.pi * tod_fraction)
@@ -120,6 +212,13 @@ def compute_time_context(timestamps: pd.DatetimeIndex) -> np.ndarray:
         [sin_tod, cos_tod, dow_onehot, sin_month, cos_month, is_holiday]
     )
     return time_context.astype(np.float32)
+
+
+def _release_columns(df: pd.DataFrame, columns: Tuple[str, ...]) -> None:
+    """Delete columns in place if present (``del`` does not warn on filtered frames)."""
+    for column in columns:
+        if column in df.columns:
+            del df[column]
 
 
 class ProxyTaskBatchIterator:
@@ -224,6 +323,9 @@ class RawObservationProxyDataset:
             target only).
         link_scaler, stop_scaler: Fitted target scalers; fitted on this
             dataset if ``None`` (the dwell scaler on stopped observations only).
+        release_inputs: Delete columns from ``df_travel`` and ``df_dwell`` in
+            place once they are used, to lower peak memory. The frames are
+            not usable afterwards. If False, they are left unmodified.
     """
 
     def __init__(
@@ -237,6 +339,7 @@ class RawObservationProxyDataset:
         log_transform: bool = False,
         link_scaler: Optional[GlobalScaler] = None,
         stop_scaler: Optional[GlobalScaler] = None,
+        release_inputs: bool = False,
     ):
         if freeflow_ratio and log_transform:
             raise ValueError("The travel time ratio target cannot be combined with log_transform")
@@ -254,64 +357,90 @@ class RawObservationProxyDataset:
         link_id_to_idx = {str(node_id): idx for idx, node_id in enumerate(link_nodes["id"])}
         stop_id_to_idx = {str(node_id): idx for idx, node_id in enumerate(stop_nodes["id"])}
 
+        # The input frames are not copied, and only modified with release_inputs:
+        # only the key Series and the needed columns of the matching rows are
+        # materialized.
+
         # --- Link (travel time) samples ---
-        df_travel = df_travel.copy()
-        df_travel["link_str"] = df_travel["link"].astype(str)
-        df_travel_valid = df_travel[df_travel["link_str"].isin(link_id_to_idx)]
-        if len(df_travel_valid) < len(df_travel):
+        link_keys = df_travel["link"].astype(str)
+        link_valid = link_keys.isin(link_id_to_idx).to_numpy()
+        link_keys = link_keys[link_valid]
+        num_link_valid = len(link_keys)
+        if num_link_valid < len(df_travel):
             logger.debug("Dropped %d travel times of links not in the graph",
-                         len(df_travel) - len(df_travel_valid))
-        if len(df_travel_valid) == 0:
+                         len(df_travel) - num_link_valid)
+        if num_link_valid == 0:
             raise ValueError("No travel time observations match the link nodes of the graph")
 
-        link_travel_times = df_travel_valid["travel_time"].to_numpy().copy()
-        ff_values = df_travel_valid["link_str"].map(freeflow_times).to_numpy(dtype=np.float64)
+        link_travel_times = df_travel.loc[link_valid, "travel_time"].to_numpy()
+        ff_values = link_keys.map(freeflow_times).to_numpy(dtype=np.float64)
         missing_ff = np.isnan(ff_values)
         if missing_ff.any():
-            missing_ids = df_travel_valid.loc[missing_ff, "link_str"].unique()  # type: ignore[union-attr]
+            missing_ids = link_keys[missing_ff].unique()
             raise ValueError(
                 f"Missing ideal travel times for {missing_ff.sum()} observations "
                 f"({len(missing_ids)} links), e.g. {list(missing_ids[:5])}"
             )
+        del missing_ff
         # Per-observation reference used to convert predictions back to seconds
         if freeflow_ratio:
             ff_safe = np.maximum(ff_values, 1.0)  # avoid division by zero
             link_values = link_travel_times / ff_safe
             self._link_freeflow_refs = torch.from_numpy(ff_safe.astype(np.float32))
+            del ff_safe
         elif log_transform:
             link_values = np.log1p(link_travel_times) - np.log1p(ff_values)
             self._link_freeflow_refs = torch.from_numpy(np.log1p(ff_values).astype(np.float32))
         else:
             link_values = link_travel_times - ff_values
             self._link_freeflow_refs = torch.from_numpy(ff_values.astype(np.float32))
+        del link_travel_times, ff_values
 
         if not self.link_scaler.is_fitted:
             self.link_scaler.fit(link_values)
 
-        link_node_indices = df_travel_valid["link_str"].map(link_id_to_idx).values
+        link_node_indices = link_keys.map(link_id_to_idx).values
+        del link_keys
         self._link_node_indices = torch.from_numpy(link_node_indices.astype(np.int64))
+        del link_node_indices
         self._link_municipalities: Optional[np.ndarray] = (
-            df_travel_valid["municipality"].values
-            if "municipality" in df_travel_valid.columns else None
+            df_travel.loc[link_valid, "municipality"].values
+            if "municipality" in df_travel.columns else None
         )
         normalized_link_times = (link_values - self.link_scaler.mean) / self.link_scaler.std
+        del link_values
         self._link_targets = torch.from_numpy(normalized_link_times.astype(np.float32))
+        del normalized_link_times
+        if release_inputs:
+            _release_columns(df_travel, ("link", "travel_time", "municipality"))
         self._link_time_context = torch.from_numpy(
-            compute_time_context(pd.DatetimeIndex(df_travel_valid["from_time"]))
+            compute_time_context(pd.DatetimeIndex(df_travel.loc[link_valid, "from_time"]))
         )
-        self._num_link_samples = len(df_travel_valid)
+        del link_valid
+        if release_inputs:
+            _release_columns(df_travel, ("from_time",))
+        self._num_link_samples = num_link_valid
 
         # --- Stop (dwell time) samples ---
-        df_dwell = df_dwell.copy()
-        df_dwell["stop_str"] = "stop_" + df_dwell["stop"].astype(str)
-        df_dwell_valid = df_dwell[df_dwell["stop_str"].isin(stop_id_to_idx)]
-        if len(df_dwell_valid) < len(df_dwell):
+        # Dwell rows hold the stop ID without the "stop_" prefix of the node IDs.
+        # Matching on the bare ID avoids building one prefixed string per row.
+        prefix = "stop_"
+        bare_stop_id_to_idx = {
+            node_id[len(prefix):]: idx
+            for node_id, idx in stop_id_to_idx.items()
+            if node_id.startswith(prefix)
+        }
+        stop_keys = df_dwell["stop"].astype(str)
+        stop_valid = stop_keys.isin(bare_stop_id_to_idx).to_numpy()
+        stop_keys = stop_keys[stop_valid]
+        num_stop_valid = len(stop_keys)
+        if num_stop_valid < len(df_dwell):
             logger.debug("Dropped %d dwell times of stops not in the graph",
-                         len(df_dwell) - len(df_dwell_valid))
-        if len(df_dwell_valid) == 0:
+                         len(df_dwell) - num_stop_valid)
+        if num_stop_valid == 0:
             raise ValueError("No dwell time observations match the stop nodes of the graph")
 
-        dwell_times = df_dwell_valid["travel_time"].to_numpy()  # dwell time in seconds
+        dwell_times = df_dwell.loc[stop_valid, "travel_time"].to_numpy()  # dwell time in seconds
         stopped_mask = dwell_times > 0
         if log_transform:
             dwell_times = np.log1p(dwell_times)
@@ -321,21 +450,29 @@ class RawObservationProxyDataset:
             if len(stopped_dwell_values) == 0:
                 raise ValueError("No stopped observations (dwell > 0) to fit the dwell time scaler")
             self.stop_scaler.fit(stopped_dwell_values)
+            del stopped_dwell_values
 
-        stop_node_indices = df_dwell_valid["stop_str"].map(stop_id_to_idx).values
+        stop_node_indices = stop_keys.map(bare_stop_id_to_idx).values
+        del stop_keys
         self._stop_node_indices = torch.from_numpy(stop_node_indices.astype(np.int64))
+        del stop_node_indices
         normalized_dwell_times = (dwell_times - self.stop_scaler.mean) / self.stop_scaler.std
+        del dwell_times
         self._stop_targets = torch.from_numpy(normalized_dwell_times.astype(np.float32))
+        del normalized_dwell_times
         self._stop_labels = torch.from_numpy(stopped_mask.astype(np.float32))
         # Aligned with the stopped observations (the dwell time regression targets)
         self._stop_municipalities: Optional[np.ndarray] = (
-            df_dwell_valid["municipality"].values[stopped_mask]
-            if "municipality" in df_dwell_valid.columns else None
+            df_dwell.loc[stop_valid, "municipality"].values[stopped_mask]
+            if "municipality" in df_dwell.columns else None
         )
+        del stopped_mask
+        if release_inputs:
+            _release_columns(df_dwell, ("stop", "travel_time", "municipality"))
         self._stop_time_context = torch.from_numpy(
-            compute_time_context(pd.DatetimeIndex(df_dwell_valid["from_time"]))
+            compute_time_context(pd.DatetimeIndex(df_dwell.loc[stop_valid, "from_time"]))
         )
-        self._num_stop_samples = len(df_dwell_valid)
+        self._num_stop_samples = num_stop_valid
 
         logger.info("Created %d link samples and %d stop samples",
                     self._num_link_samples, self._num_stop_samples)
