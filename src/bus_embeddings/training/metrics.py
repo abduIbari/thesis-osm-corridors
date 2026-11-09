@@ -134,21 +134,18 @@ def _seasonal_naive_errors(
     The forecast for an observation is the most recent observation of the
     same node at or before one week earlier.
     """
-    eval_df = df_eval[[id_col, time_col, value_col]].copy()
-    eval_df["_ts_lag"] = eval_df[time_col] - _SEASONAL_PERIOD
+    # Only the columns the merge needs, one shared time key, and the unsorted
+    # frames freed by reassignment. Row order and matches must not change:
+    # sort_values is not stable, so it must see these same key arrays.
+    left = df_eval[[id_col, value_col]].assign(_ts_lag=df_eval[time_col] - _SEASONAL_PERIOD)
+    left = left.sort_values("_ts_lag")
 
-    hist = df_history[[id_col, time_col, value_col]].copy()
-    hist = hist.rename(columns={value_col: "_naive_value"})
+    right = df_history[[id_col, time_col, value_col]]
+    right.columns = [id_col, "_ts_lag", "_naive_value"]
+    right = right.sort_values("_ts_lag")
 
-    merged = pd.merge_asof(
-        eval_df.sort_values("_ts_lag"),
-        hist.sort_values(time_col),
-        left_on="_ts_lag",
-        right_on=time_col,
-        by=id_col,
-        direction="backward",
-        suffixes=("", "_hist"),
-    )
+    merged = pd.merge_asof(left, right, on="_ts_lag", by=id_col, direction="backward")
+    del left, right
 
     matched = merged["_naive_value"].notna()
     if not matched.any():
@@ -234,6 +231,7 @@ def compute_seasonal_naive_metrics_by_region(
     mase_vals: list[float] = []
     rmsse_vals: list[float] = []
     n_matched = 0
+    needed_cols = [id_col, time_col, value_col]
 
     for region in np.unique(model_regions):
         mask = model_regions == region
@@ -243,8 +241,8 @@ def compute_seasonal_naive_metrics_by_region(
         model_rmse_r = float(np.sqrt(np.mean((preds_r - targets_r) ** 2)))
 
         sn = compute_seasonal_naive_metrics(
-            df_eval=df_eval[df_eval[region_col] == region],
-            df_history=df_history[df_history[region_col] == region],
+            df_eval=df_eval.loc[df_eval[region_col] == region, needed_cols],
+            df_history=df_history.loc[df_history[region_col] == region, needed_cols],
             id_col=id_col,
             model_mae=model_mae_r,
             model_rmse=model_rmse_r,
