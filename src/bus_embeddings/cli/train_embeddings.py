@@ -56,6 +56,7 @@ from bus_embeddings.training.metrics import (
     compute_oversmoothing_metrics,
     compute_seasonal_naive_metrics,
     compute_seasonal_naive_metrics_by_region,
+    seasonal_naive_errors_by_region,
 )
 from bus_embeddings.training.train_utils import compute_geometric_mean, seed_all, uses_ratio_target
 from bus_embeddings.utils.hetero_graph_utils import build_hetero_graph
@@ -383,6 +384,7 @@ def add_scaled_errors(
     dataset: RawObservationProxyDataset,
     observations: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
     per_region: bool = True,
+    naive: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """Add seasonal MASE and RMSSE of links and stops to ``result.metrics``.
 
@@ -390,6 +392,8 @@ def add_scaled_errors(
     observations and the history the seasonal naive forecast is taken from.
     With ``per_region`` the ratios are computed per municipality and combined
     with the geometric mean; otherwise they are pooled over all municipalities.
+    ``naive`` holds the per-region naive errors from ``naive_errors_by_region``
+    for these observations; they are then reused instead of computed again.
     """
     for node_type, preds, targets, regions in (
         ("link", result.link_preds, result.link_targets, dataset.link_municipalities),
@@ -403,6 +407,7 @@ def add_scaled_errors(
                 raise ValueError("Observations have no municipality column")
             scaled = compute_seasonal_naive_metrics_by_region(
                 df_eval, df_history, node_type, preds, targets, regions,
+                naive_by_region=naive.get(node_type) if naive is not None else None,
             )
         else:
             scaled = compute_seasonal_naive_metrics(
@@ -413,6 +418,29 @@ def add_scaled_errors(
         for metric in ("mase", "rmsse"):
             if metric in scaled:
                 result.metrics[f"{node_type}/{metric}"] = scaled[metric]
+
+
+def naive_errors_by_region(
+    dataset: RawObservationProxyDataset,
+    observations: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]],
+) -> Dict[str, Dict[str, Any]]:
+    """Per-region seasonal naive errors of links and stops, for ``add_scaled_errors``.
+
+    They depend only on the observations, so within a fold the validation
+    scoring of every epoch can reuse them.
+    """
+    naive: Dict[str, Dict[str, Any]] = {}
+    for node_type, regions in (
+        ("link", dataset.link_municipalities),
+        ("stop", dataset.stop_municipalities),
+    ):
+        if regions is None:
+            continue
+        df_eval, df_history = observations[node_type]
+        naive[node_type] = seasonal_naive_errors_by_region(
+            df_eval, df_history, node_type, np.unique(regions),
+        )
+    return naive
 
 
 def validation_score(result: EvalResult) -> float:
@@ -482,6 +510,10 @@ def train_gnn(
         subsample=hyperparams["train-subsample"],
     )
 
+    # The seasonal naive errors of the validation observations are the same in
+    # every epoch, so compute them once for the fold
+    val_naive = naive_errors_by_region(val_dataset, val_observations)
+
     best_score = float("inf")
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_result: Optional[EvalResult] = None
@@ -496,7 +528,7 @@ def train_gnn(
             model, val_graph, val_dataset, device, hyperparams,
             train_dataset.link_scaler, train_dataset.stop_scaler, ratio_target,
         )
-        add_scaled_errors(val, val_dataset, val_observations)
+        add_scaled_errors(val, val_dataset, val_observations, naive=val_naive)
         score = validation_score(val)
 
         logger.info(
