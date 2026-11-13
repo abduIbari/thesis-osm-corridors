@@ -1,5 +1,5 @@
 """Evaluation metrics: embedding diversity (MAD, MADGap) and seasonal MASE / RMSSE."""
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -176,6 +176,27 @@ def compute_seasonal_naive_metrics(
         Dict with ``naive_mae``, ``naive_rmse``, ``naive_n_matched``, ``mase``
         and ``rmsse``; empty if no observation has a week-old counterpart.
     """
+    naive = seasonal_naive_errors(df_eval, df_history, id_col, time_col, value_col)
+    return _scale_by_naive(model_mae, model_rmse, naive)
+
+
+# MAE, RMSE and number of matched observations of the seasonal naive forecast
+NaiveErrors = Tuple[float, float, int]
+
+
+def seasonal_naive_errors(
+    df_eval: pd.DataFrame,
+    df_history: pd.DataFrame,
+    id_col: str,
+    time_col: str = "from_time",
+    value_col: str = "travel_time",
+) -> Optional[NaiveErrors]:
+    """MAE, RMSE and match count of the weekly seasonal naive forecast.
+
+    Depends only on the observations, not on a model, so it can be computed
+    once and reused for every evaluation of the same observations. ``None``
+    if no observation has a week-old counterpart.
+    """
     actuals, naive_forecasts = _seasonal_naive_errors(
         df_eval=df_eval,
         df_history=df_history,
@@ -185,22 +206,50 @@ def compute_seasonal_naive_metrics(
     )
     if len(actuals) == 0:
         _logger.warning("No week-ago matches for the seasonal naive forecast (%s).", id_col)
-        return {}
+        return None
 
     naive_errors = actuals - naive_forecasts
     naive_mae = float(np.mean(np.abs(naive_errors)))
     naive_rmse = float(np.sqrt(np.mean(naive_errors ** 2)))
+    return naive_mae, naive_rmse, len(actuals)
 
+
+def _scale_by_naive(model_mae: float, model_rmse: float, naive: Optional[NaiveErrors]) -> Dict[str, float]:
+    """MASE and RMSSE of a model from its errors and the naive errors."""
+    if naive is None:
+        return {}
+    naive_mae, naive_rmse, n_matched = naive
     result: Dict[str, float] = {
         "naive_mae": naive_mae,
         "naive_rmse": naive_rmse,
-        "naive_n_matched": len(actuals),
+        "naive_n_matched": n_matched,
     }
     if naive_mae > 0:
         result["mase"] = model_mae / naive_mae
     if naive_rmse > 0:
         result["rmsse"] = model_rmse / naive_rmse
     return result
+
+
+def seasonal_naive_errors_by_region(
+    df_eval: pd.DataFrame,
+    df_history: pd.DataFrame,
+    id_col: str,
+    regions: Iterable[str],
+    time_col: str = "from_time",
+    value_col: str = "travel_time",
+    region_col: str = "municipality",
+) -> Dict[str, Optional[NaiveErrors]]:
+    """``seasonal_naive_errors`` of each region, for reuse across evaluations."""
+    needed_cols = [id_col, time_col, value_col]
+    return {
+        region: seasonal_naive_errors(
+            df_eval.loc[df_eval[region_col] == region, needed_cols],
+            df_history.loc[df_history[region_col] == region, needed_cols],
+            id_col, time_col, value_col,
+        )
+        for region in regions
+    }
 
 
 def compute_seasonal_naive_metrics_by_region(
@@ -213,6 +262,7 @@ def compute_seasonal_naive_metrics_by_region(
     time_col: str = "from_time",
     value_col: str = "travel_time",
     region_col: str = "municipality",
+    naive_by_region: Optional[Dict[str, Optional[NaiveErrors]]] = None,
 ) -> Dict[str, Any]:
     """Seasonal MASE / RMSSE per region, combined with the geometric mean.
 
@@ -223,6 +273,10 @@ def compute_seasonal_naive_metrics_by_region(
         model_preds: Model predictions in seconds, aligned with ``model_regions``.
         model_targets: Observed values in seconds, aligned with ``model_regions``.
         model_regions: Region of each prediction.
+        naive_by_region: Naive errors per region from
+            ``seasonal_naive_errors_by_region`` on the same observations. If
+            given, they are reused instead of computed again; the result is
+            the same.
 
     Returns:
         Dict with ``mase`` and ``rmsse`` (geometric means over regions) and
@@ -240,15 +294,18 @@ def compute_seasonal_naive_metrics_by_region(
         model_mae_r = float(np.mean(np.abs(preds_r - targets_r)))
         model_rmse_r = float(np.sqrt(np.mean((preds_r - targets_r) ** 2)))
 
-        sn = compute_seasonal_naive_metrics(
-            df_eval=df_eval.loc[df_eval[region_col] == region, needed_cols],
-            df_history=df_history.loc[df_history[region_col] == region, needed_cols],
-            id_col=id_col,
-            model_mae=model_mae_r,
-            model_rmse=model_rmse_r,
-            time_col=time_col,
-            value_col=value_col,
-        )
+        if naive_by_region is not None and region in naive_by_region:
+            sn = _scale_by_naive(model_mae_r, model_rmse_r, naive_by_region[region])
+        else:
+            sn = compute_seasonal_naive_metrics(
+                df_eval=df_eval.loc[df_eval[region_col] == region, needed_cols],
+                df_history=df_history.loc[df_history[region_col] == region, needed_cols],
+                id_col=id_col,
+                model_mae=model_mae_r,
+                model_rmse=model_rmse_r,
+                time_col=time_col,
+                value_col=value_col,
+            )
         if not sn:
             continue
         n_matched += int(sn["naive_n_matched"])
