@@ -107,6 +107,14 @@ FEATURE_GROUPS: Dict[str, List[str]] = {
     # --- GTFS link features ---
     "use-gtfs-link-pos": ["gtfs_link_pos"],
     "use-gtfs-link-frequency": ["gtfs_frequency_1d"],
+    # --- Thesis corridor features on links (level 1) ---
+    # POI counts per km and land-use shares inside the 100 m corridor around
+    # each link's Valhalla path. Only present in the artifact copies made by
+    # thesis/add_columns.py; off by default (training/config.py).
+    "use-corridor-l1": (
+        [f"corridor_poi_{cat}_per_km" for cat in POI_CATEGORY_NAMES]
+        + [f"corridor_landuse_{cat}" for cat in LANDUSE_CATEGORY_NAMES]
+    ),
 }
 
 

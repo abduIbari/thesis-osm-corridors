@@ -99,6 +99,9 @@ FEATURE_CONFIG: Dict[str, bool] = {
     # Link features (GTFS)
     "use-gtfs-link-pos": True,
     "use-gtfs-link-frequency": True,
+    # Thesis corridor features (level 1), off for the baseline. Switch on with
+    # --set use-corridor-l1=true and --artifacts-dir data/corridor/l1.
+    "use-corridor-l1": False,
 }
 
 if set(FEATURE_CONFIG) != set(FEATURE_GROUPS):
