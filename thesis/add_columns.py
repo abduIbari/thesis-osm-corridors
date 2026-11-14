@@ -7,7 +7,7 @@ line is kept byte for byte, so his columns can't change.
 
 Run from ~/thesis after level1.py build has run for all 18 cities:
 
-    bus-embeddings-corridor/thesis/.venv/bin/python -I bus-embeddings-corridor/thesis/add_columns.py l1
+    bus-embeddings/thesis/.venv/bin/python -I bus-embeddings/thesis/add_columns.py l1
 
 Checks, any failure stops the script before anything is written:
     - every city in REGION_SPLIT has an artifact folder and a feature file

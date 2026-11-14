@@ -4,10 +4,10 @@
 # Run from ~/thesis. Each city's output and peak memory go to
 # data/corridor/logs/<GM>.log.
 #
-#   sh bus-embeddings-corridor/thesis/build_corridor_features.sh GM0599 GM0518
+#   sh bus-embeddings/thesis/build_corridor_features.sh GM0599 GM0518
 set -e
-PY=bus-embeddings-corridor/thesis/.venv/bin/python
-T=bus-embeddings-corridor/thesis
+PY=bus-embeddings/thesis/.venv/bin/python
+T=bus-embeddings/thesis
 mkdir -p data/corridor/logs
 for city in "$@"; do
     log=data/corridor/logs/$city.log

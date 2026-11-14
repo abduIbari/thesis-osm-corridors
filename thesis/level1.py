@@ -7,9 +7,9 @@ corridor.
 
 Run from ~/thesis after corridors.py cut and build:
 
-    PY=bus-embeddings-corridor/thesis/.venv/bin/python
-    $PY -I bus-embeddings-corridor/thesis/level1.py check GM0503
-    $PY -I bus-embeddings-corridor/thesis/level1.py build GM0503
+    PY=bus-embeddings/thesis/.venv/bin/python
+    $PY -I bus-embeddings/thesis/level1.py check GM0503
+    $PY -I bus-embeddings/thesis/level1.py build GM0503
 
 `check` compares this reader with Horn's own stop columns and shows how much
 overlapping land-use areas change the shares. `build` writes

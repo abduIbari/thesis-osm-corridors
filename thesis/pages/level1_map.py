@@ -2,7 +2,7 @@
 
 Run from ~/thesis after level1.py build:
 
-    bus-embeddings-corridor/thesis/.venv/bin/python -I bus-embeddings-corridor/thesis/pages/level1_map.py GM0503 delft
+    bus-embeddings/thesis/.venv/bin/python -I bus-embeddings/thesis/pages/level1_map.py GM0503 delft
 """
 
 import csv

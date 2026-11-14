@@ -4,7 +4,11 @@ Runs train_embeddings for 1 epoch per fold. Its log, metrics and checkpoints go
 to a run folder that is deleted at the end, so no score is kept or shown. Stops
 the run only if free RAM plus free swap drops below MIN_FREE_MB.
 
-Usage: python trial_run.py SUMMARY_FILE
+Usage: python trial_run.py SUMMARY_FILE [EXTRA TRAINING ARGUMENTS]
+
+Extra arguments go to the end of the training command. A later option wins, so
+a level is trialled with, for example:
+    python trial_run.py SUMMARY_FILE --artifacts-dir data/corridor/l1 --set use-corridor-l1=true
 """
 import os
 import re
@@ -78,7 +82,9 @@ cmd = [
     "--dwell-times-parquet", str(ROOT / "data/preprocessed/dwell_times.parquet"),
     "--model", "gat", "--seed", "42", "--set", "epochs=1",
     "--output-dir", str(RUN_DIR / "out"),
+    *sys.argv[2:],
 ]
+say("Command: " + " ".join(cmd[1:]))
 say(f"Start: MemAvailable {available_mb()} MB, GPU used {gpu_mb()} MB")
 start = time.time()
 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
