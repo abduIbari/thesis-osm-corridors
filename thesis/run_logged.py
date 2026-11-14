@@ -7,6 +7,8 @@ Stops an attempt only if free RAM plus free swap drops below MIN_FREE_MB, and
 retries a failed attempt up to MAX_ATTEMPTS times.
 
 Usage: python run_logged.py RUN_DIR [train_embeddings arguments ...]
+RUN_DIR is data/runs/<level>/run<N>_seed<S>. Starting again in an existing
+RUN_DIR (same code, for example after a shutdown) adds attempt_<next>.
 """
 import datetime as dt
 import os
@@ -187,11 +189,13 @@ note(f"- Code: {shell(['git', '-C', str(ROOT / 'bus-embeddings'), 'log', '--onel
 note(f"- Uncommitted code changes: {shell(['git', '-C', str(ROOT / 'bus-embeddings'), 'status', '--short', 'src']) or 'none'}")
 note(f"- GPU: {shell(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'])}")
 overall = time.time()
-for attempt in range(1, MAX_ATTEMPTS + 1):
+# A restart of the same run continues the numbering, so earlier attempts are never overwritten
+first = 1 + max((int(p.name.split("_")[1]) for p in RUN_DIR.glob("attempt_*") if p.name.split("_")[1].isdigit()), default=0)
+for attempt in range(first, first + MAX_ATTEMPTS):
     if run_attempt(attempt):
         break
-    if attempt < MAX_ATTEMPTS:
-        note(f"\nRetrying in 60 s (attempt {attempt + 1} of {MAX_ATTEMPTS}).")
+    if attempt < first + MAX_ATTEMPTS - 1:
+        note(f"\nRetrying in 60 s (try {attempt - first + 2} of {MAX_ATTEMPTS}).")
         time.sleep(60)
 else:
     note(f"\nAll {MAX_ATTEMPTS} attempts failed.")
