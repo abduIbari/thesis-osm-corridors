@@ -21,6 +21,9 @@ EXCLUDE_FEATURES: frozenset[str] = frozenset({
     "osm_lanes_8_frac",
     "osm_poi_sports_recreation_500m",
     "osm_poi_tourism_500m",
+    # Thesis level 1: the same two categories are always empty in the corridor.
+    "corridor_poi_sports_recreation_per_km",
+    "corridor_poi_tourism_per_km",
 })
 
 # Skewed distance, duration and count features that are log1p-transformed
@@ -39,6 +42,17 @@ LOG_TRANSFORM_FEATURES: frozenset[str] = frozenset({
     "osm_poi_services_500m",
     "osm_poi_worship_500m",
     "osm_poi_other_amenity_500m",
+    # Thesis level 1: corridor POI counts per km, treated like the stop POI counts.
+    "corridor_poi_food_drink_per_km",
+    "corridor_poi_shopping_per_km",
+    "corridor_poi_education_per_km",
+    "corridor_poi_healthcare_per_km",
+    "corridor_poi_transport_per_km",
+    "corridor_poi_finance_per_km",
+    "corridor_poi_entertainment_per_km",
+    "corridor_poi_services_per_km",
+    "corridor_poi_worship_per_km",
+    "corridor_poi_other_amenity_per_km",
 })
 
 # (edge type in edges.csv, source node type, relation, target node type)
