@@ -102,6 +102,10 @@ FEATURE_CONFIG: Dict[str, bool] = {
     # Thesis corridor features (level 1), off for the baseline. Switch on with
     # --set use-corridor-l1=true and --artifacts-dir data/corridor/l1.
     "use-corridor-l1": False,
+    # Thesis corridor features (level 2), off for the baseline. Switch on with
+    # --set use-corridor-l2=true and --artifacts-dir data/corridor/l2_top100_jev
+    # (or l2_top100_all, l2_top500_jev, l2_top500_all).
+    "use-corridor-l2": False,
 }
 
 if set(FEATURE_CONFIG) != set(FEATURE_GROUPS):

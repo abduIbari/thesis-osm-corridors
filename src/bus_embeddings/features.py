@@ -115,6 +115,12 @@ FEATURE_GROUPS: Dict[str, List[str]] = {
         [f"corridor_poi_{cat}_per_km" for cat in POI_CATEGORY_NAMES]
         + [f"corridor_landuse_{cat}" for cat in LANDUSE_CATEGORY_NAMES]
     ),
+    # --- Thesis corridor features on links (level 2) ---
+    # 64 PCA numbers from the counts of the most common OSM tags in each
+    # link's corridor (thesis/level2.py build; already log1p'd, scaled and
+    # PCA'd there, so no log or exclude rule). Four versions, one folder each
+    # (data/corridor/l2_top{100,500}_{jev,all}), all with these columns.
+    "use-corridor-l2": [f"corridor_l2_pca_{i:02d}" for i in range(1, 65)],
 }
 
 

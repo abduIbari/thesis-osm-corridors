@@ -5,9 +5,11 @@ nodes_stop.csv and edges.csv unchanged, nodes_link.csv with the level's columns
 appended at the end of every line, matched by link id. Horn's own text in each
 line is kept byte for byte, so his columns can't change.
 
-Run from ~/thesis after level1.py build has run for all 18 cities:
+Run from ~/thesis after level1.py build (l1) or level2.py build (l2_*) has run for all 18 cities:
 
     bus-embeddings/thesis/.venv/bin/python -I bus-embeddings/thesis/add_columns.py l1
+    bus-embeddings/thesis/.venv/bin/python -I bus-embeddings/thesis/add_columns.py l2_top100_jev   # also l2_top100_all,
+                                                                          # l2_top500_jev, l2_top500_all
 
 Checks, any failure stops the script before anything is written:
     - every city in REGION_SPLIT has an artifact folder and a feature file
@@ -28,6 +30,11 @@ from pathlib import Path
 DATA = Path("/home/abdulbari/thesis/data")
 CONFIG = Path(__file__).parents[1] / "src/bus_embeddings/training/config.py"
 FEATURE_FILE = {"l1": "level1.csv"}
+# Level 2 comes in four versions (decided 2026-11-20): top 100 or top 500 tags, from OpenJev's kept list (jev) or
+# from all candidates (all). Each gets its own folder; the switch use-corridor-l2 is the same for all four.
+for _top in (100, 500):
+    for _kept in ("jev", "all"):
+        FEATURE_FILE[f"l2_top{_top}_{_kept}"] = f"level2_top{_top}_{_kept}.csv"
 
 
 def all_cities():
